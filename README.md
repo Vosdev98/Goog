@@ -44,7 +44,13 @@ crates, a sandy sun-lit skybox). Goog grabs an **AK-47** and fights a **4-wave m
 - **Between waves:** grab dropped **health** and **ammo** pickups.
 - **Shoot down incoming projectiles**, take cover (walls block bullets & sightlines), clear all waves, then reach the **exit archway** for **MISSION COMPLETE** (with kills + accuracy stats).
 - 100 HP, 3 lives (respawn on death). A **🔫 TACTICAL TEST** button on the title jumps straight in.
-- **Touch:** drag to look, hold to advance + auto-fire.
+
+## Mobile
+
+Fully touch-optimized (auto-detected). Act 2 uses real mobile-FPS controls:
+- **Left thumb** = virtual movement joystick (analog), **right thumb** = drag to look, **FIRE** button (bottom-right) to shoot, **⟳** to reload — all multi-touch, so you can move, aim, and fire at once.
+- Act 1 stays drag-to-move. Finger-sized buttons, scaled HUD, portrait-fit title, safe-area aware (`viewport-fit=cover`).
+- Performance tuned for phones: lower DPR, AA off, reduced geometry detail, culled distant scenery, fewer particles.
 
 ## Tech
 
