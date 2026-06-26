@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Wiggle Goog</title>
+<style>
+  :root { --bg:#1a0f2e; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); }
+  body {
+    font-family: "Comic Sans MS", "Trebuchet MS", system-ui, sans-serif;
+    touch-action:none; -webkit-user-select:none; user-select:none;
+  }
+  #game { display:block; width:100vw; height:100vh; cursor:crosshair; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+/* ============================================================
+   WIGGLE GOOG  —  a wacky googly-eyed jelly arcade game
+   Gobble snackles, dodge wobbles, don't pop.
+   ============================================================ */
+
+// ---------- Canvas & DPR-aware resize ----------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+let vignette = null;
+function buildVignette() {
+  vignette = document.createElement("canvas");
+  vignette.width = Math.max(1, W); vignette.height = Math.max(1, H);
+  const vc = vignette.getContext("2d");
+  const g = vc.createRadialGradient(W/2, H/2, Math.min(W,H)*0.35, W/2, H/2, Math.max(W,H)*0.75);
+  g.addColorStop(0, "rgba(0,0,0,0)");
+  g.addColorStop(1, "rgba(0,0,0,0.55)");
+  vc.fillStyle = g; vc.fillRect(0, 0, W, H);
+}
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.floor(W * DPR); canvas.height = Math.floor(H * DPR);
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildVignette();
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ---------- Math helpers ----------
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const TAU = Math.PI * 2;
+const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx*dx + dy*dy; };
+
+// ============================================================
+//  AUDIO  — procedural SFX via Web Audio (no asset files)
+// ============================================================
+const Sound = {
+  ctx: null, master: null, enabled: true, noiseBuf: null,
+  init() {
+    if (this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { this.enabled = false; return; }
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = 0.5;
+    this.master.connect(this.ctx.destination);
+    // pre-bake a noise buffer for crunchy/pop sounds
+    const n = this.ctx.sampleRate * 0.4;
+    this.noiseBuf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
+    const d = this.noiseBuf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+  },
+  resume() { if (this.ctx && this.ctx.state === "suspended") this.ctx.resume(); },
+  tone(freq, dur, type = "sine", vol = 0.3, slideTo = null, delay = 0) {
+    if (!this.enabled || !this.ctx) return;
+    const t = this.ctx.currentTime + delay;
+    const o = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(1, slideTo), t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol = 0.3, hp = 400, delay = 0) {
+    if (!this.enabled || !this.ctx) return;
+    const t = this.ctx.currentTime + delay;
+    const src = this.ctx.createBufferSource(); src.buffer = this.noiseBuf;
+    const g = this.ctx.createGain();
+    const f = this.ctx.createBiquadFilter(); f.type = "highpass"; f.frequency.value = hp;
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f); f.connect(g); g.connect(this.master);
+    src.start(t); src.stop(t + dur);
+  },
+  eat(combo) {
+    const base = 420 + Math.min(combo, 20) * 32;
+    this.tone(base, 0.12, "triangle", 0.28, base * 1.7);
+    this.tone(base * 1.5, 0.10, "sine", 0.12, base * 2.1, 0.02);
+  },
+  golden() {
+    [0,0.06,0.12,0.18].forEach((d,i)=> this.tone(523*Math.pow(1.26,i), 0.16, "triangle", 0.26, null, d));
+  },
+  bounce() { this.tone(150, 0.12, "sine", 0.22, 70); },
+  hurt() { this.tone(300, 0.3, "sawtooth", 0.3, 60); this.noise(0.3, 0.25, 300); },
+  power() { [0,0.07,0.14,0.21,0.28].forEach((d,i)=> this.tone(330*Math.pow(1.2,i), 0.18, "square", 0.18, null, d)); },
+  start() { this.tone(330,0.1,"triangle",0.25,520); this.tone(520,0.12,"triangle",0.22,780,0.08); },
+  over() { [0,0.15,0.3].forEach((d,i)=> this.tone(440/Math.pow(1.3,i), 0.3, "sawtooth", 0.25, 100, d)); },
+};
+
+// ---------- Input (keyboard + touch + click) ----------
+const keys = new Set();
+const Input = { ax: 0, ay: 0, anyDown: false };
+const KEYMAP = {
+  ArrowUp:"up", KeyW:"up", ArrowDown:"down", KeyS:"down",
+  ArrowLeft:"left", KeyA:"left", ArrowRight:"right", KeyD:"right",
+};
+function firstGesture() { Sound.init(); Sound.resume(); }
+// mute button hit-test (bottom-left corner)
+function muteBtnHit(x, y) { return x >= 14 && x <= 52 && y >= H - 52 && y <= H - 14; }
+function pointerDown(x, y) {
+  firstGesture();
+  if (muteBtnHit(x, y)) { Sound.enabled = !Sound.enabled; return true; } // consumed
+  Game.onActionKey();
+  return false;
+}
+addEventListener("keydown", e => {
+  firstGesture();
+  if (e.code === "KeyM") { Sound.enabled = !Sound.enabled; return; }
+  if (KEYMAP[e.code]) { keys.add(KEYMAP[e.code]); e.preventDefault(); }
+  Game.onActionKey();
+});
+addEventListener("keyup", e => { if (KEYMAP[e.code]) { keys.delete(KEYMAP[e.code]); e.preventDefault(); } });
+addEventListener("blur", () => keys.clear());
+document.addEventListener("visibilitychange", () => { if (document.hidden) keys.clear(); });
+
+let touchTarget = null;
+function touchPos(e) { const t = e.changedTouches ? e.changedTouches[0] : e; return { x: t.clientX, y: t.clientY }; }
+canvas.addEventListener("touchstart", e => { const p = touchPos(e); if (!pointerDown(p.x, p.y)) touchTarget = p; e.preventDefault(); }, { passive:false });
+canvas.addEventListener("touchmove",  e => { if (touchTarget) touchTarget = touchPos(e); e.preventDefault(); }, { passive:false });
+canvas.addEventListener("touchend",   e => { touchTarget = null; e.preventDefault(); }, { passive:false });
+canvas.addEventListener("mousedown",  e => { pointerDown(e.clientX, e.clientY); });
+
+function readInput(px, py) {
+  let ax = 0, ay = 0;
+  if (keys.has("left")) ax -= 1;
+  if (keys.has("right")) ax += 1;
+  if (keys.has("up")) ay -= 1;
+  if (keys.has("down")) ay += 1;
+  if (touchTarget) {
+    const dx = touchTarget.x - px, dy = touchTarget.y - py, d = Math.hypot(dx, dy);
+    if (d > 6) { ax += dx / d; ay += dy / d; }
+  }
+  const m = Math.hypot(ax, ay);
+  if (m > 1) { ax /= m; ay /= m; }
+  Input.ax = ax; Input.ay = ay; Input.anyDown = m > 0.01;
+}
+
+// ============================================================
+//  GOOG — the player
+// ============================================================
+const BASE_R = 30;
+class Goog {
+  constructor() { this.reset(); }
+  reset() {
+    this.x = W / 2; this.y = H / 2; this.vx = 0; this.vy = 0;
+    this.r = BASE_R; this.facing = -Math.PI/2;
+    this.wobblePhase = 0; this.wobbleAmp = 0.08; this.squash = 0;
+    this.eyes = [{px:0,py:0,pvx:0,pvy:0},{px:0,py:0,pvx:0,pvy:0}];
+    this.accel = 2600; this.maxSpeed = 470; this.friction = 4.0;
+    this.invuln = 0; this.hue = 150; this.trail = [];
+  }
+  get eatRadius() { return this.r * 1.05; }
+  hit(combo) { this.wobbleAmp = Math.min(1, this.wobbleAmp + 0.45); }
+  update(dt, control) {
+    if (control) readInput(this.x, this.y); else { Input.ax = Input.ay = 0; Input.anyDown = false; }
+    const boost = Game.power.speed > 0 ? 1.35 : 1;
+    this.vx += Input.ax * this.accel * boost * dt;
+    this.vy += Input.ay * this.accel * boost * dt;
+    const fr = Math.exp(-this.friction * dt);
+    this.vx *= fr; this.vy *= fr;
+    const sp = Math.hypot(this.vx, this.vy), ms = this.maxSpeed * boost;
+    if (sp > ms) { this.vx = this.vx/sp*ms; this.vy = this.vy/sp*ms; }
+    this.x += this.vx * dt; this.y += this.vy * dt;
+
+    const r = this.r; let bounced = false;
+    if (this.x < r) { this.x = r; this.vx = Math.abs(this.vx)*0.72; bounced = true; }
+    if (this.x > W-r) { this.x = W-r; this.vx = -Math.abs(this.vx)*0.72; bounced = true; }
+    if (this.y < r) { this.y = r; this.vy = Math.abs(this.vy)*0.72; bounced = true; }
+    if (this.y > H-r) { this.y = H-r; this.vy = -Math.abs(this.vy)*0.72; bounced = true; }
+    if (bounced && sp > 120) { this.wobbleAmp = Math.min(1, this.wobbleAmp+0.4); if (Math.random()<0.5) Sound.bounce(); }
+
+    if (sp > 12) this.facing = Math.atan2(this.vy, this.vx);
+    const speedN = clamp(sp / this.maxSpeed, 0, 1);
+    this.squash = lerp(this.squash, speedN*0.42, 1 - Math.exp(-10*dt));
+    this.wobblePhase += dt * (6 + speedN*10);
+    this.wobbleAmp = lerp(this.wobbleAmp, 0.06 + speedN*0.10, 1 - Math.exp(-6*dt));
+    if (this.invuln > 0) this.invuln -= dt;
+    // motion trail (afterimages while zipping around)
+    if (sp > 150) { this.trail.push({ x:this.x, y:this.y, r:this.r }); if (this.trail.length > 9) this.trail.shift(); }
+    else if (this.trail.length) this.trail.shift();
+    this.updateEyes(dt);
+  }
+  drawTrail(ctx) {
+    const shielded = Game.power.shield > 0;
+    for (let i = 0; i < this.trail.length; i++) {
+      const t = this.trail[i], a = (i + 1) / this.trail.length * 0.16;
+      ctx.globalAlpha = a; ctx.beginPath(); ctx.arc(t.x, t.y, t.r * 0.92, 0, TAU);
+      ctx.fillStyle = shielded ? "#46c8ff" : "#27d98a"; ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  updateEyes(dt) {
+    const ax = -this.vx*0.018, ay = -this.vy*0.018 + 24, socket = this.r*0.20;
+    for (const e of this.eyes) {
+      e.pvx += ax*dt*60; e.pvy += ay*dt*60;
+      e.pvx += -e.px*18*dt; e.pvy += -e.py*18*dt;
+      e.pvx *= Math.exp(-3*dt); e.pvy *= Math.exp(-3*dt);
+      e.px += e.pvx*dt; e.py += e.pvy*dt;
+      const d = Math.hypot(e.px, e.py);
+      if (d > socket) { e.px=e.px/d*socket; e.py=e.py/d*socket; e.pvx*=-0.4; e.pvy*=-0.4; }
+    }
+  }
+  draw(ctx) {
+    this.drawTrail(ctx);
+    // invuln flicker
+    if (this.invuln > 0 && (Math.floor(this.invuln*16)%2===0)) { this.drawEyes(ctx); return; }
+    const sp = Math.hypot(this.vx, this.vy);
+    const shielded = Game.power.shield > 0;
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    if (sp > 12) ctx.rotate(this.facing);
+    ctx.scale(1 + this.squash, 1 - this.squash*0.7);
+    if (sp > 12) ctx.rotate(-this.facing);
+    const N = 24, r = this.r;
+    ctx.beginPath();
+    for (let i = 0; i <= N; i++) {
+      const a = (i/N)*TAU;
+      const wob = 1 + this.wobbleAmp*Math.sin(a*3+this.wobblePhase) + this.wobbleAmp*0.5*Math.sin(a*5-this.wobblePhase*1.3);
+      const rr = r*wob, x = Math.cos(a)*rr, y = Math.sin(a)*rr;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.closePath();
+    const c0 = shielded ? "#9fe9ff" : "#7bf7c0", c1 = shielded ? "#46c8ff" : "#27d98a", c2 = shielded ? "#1f8fd6" : "#11a866";
+    const g = ctx.createRadialGradient(-r*0.3,-r*0.4,r*0.1,0,0,r*1.3);
+    g.addColorStop(0,c0); g.addColorStop(0.6,c1); g.addColorStop(1,c2);
+    ctx.fillStyle = g;
+    ctx.shadowColor = shielded ? "rgba(70,200,255,0.7)" : "rgba(39,217,138,0.55)";
+    ctx.shadowBlur = shielded ? 32 : 24; ctx.fill(); ctx.shadowBlur = 0;
+    ctx.beginPath(); ctx.ellipse(-r*0.3,-r*0.45,r*0.32,r*0.2,-0.5,0,TAU);
+    ctx.fillStyle = "rgba(255,255,255,0.45)"; ctx.fill();
+    ctx.restore();
+    if (shielded) {
+      ctx.beginPath(); ctx.arc(this.x, this.y, r*1.5, 0, TAU);
+      ctx.strokeStyle = `rgba(120,220,255,${0.4+0.2*Math.sin(this.wobblePhase*3)})`;
+      ctx.lineWidth = 3; ctx.stroke();
+    }
+    this.drawEyes(ctx);
+  }
+  drawEyes(ctx) {
+    const r = this.r, dx = Math.cos(this.facing), dy = Math.sin(this.facing);
+    const px = -dy, py = dx, fwd = r*0.34, spread = r*0.46, eyeR = r*0.40;
+    for (let i = 0; i < 2; i++) {
+      const s = i===0 ? -1 : 1;
+      const ex = this.x + dx*fwd + px*spread*s, ey = this.y + dy*fwd + py*spread*s;
+      ctx.beginPath(); ctx.arc(ex,ey,eyeR,0,TAU); ctx.fillStyle="#fff"; ctx.fill();
+      ctx.lineWidth=2; ctx.strokeStyle="rgba(0,0,0,0.15)"; ctx.stroke();
+      const e = this.eyes[i];
+      ctx.beginPath(); ctx.arc(ex+e.px,ey+e.py,eyeR*0.5,0,TAU); ctx.fillStyle="#16121f"; ctx.fill();
+      ctx.beginPath(); ctx.arc(ex+e.px-eyeR*0.16,ey+e.py-eyeR*0.16,eyeR*0.14,0,TAU);
+      ctx.fillStyle="rgba(255,255,255,0.9)"; ctx.fill();
+    }
+  }
+}
+
+// ============================================================
+//  ENTITIES
+// ============================================================
+const SNACK_HUES = [12, 45, 320, 200, 270, 100];
+class Snackle {
+  constructor(golden=false) {
+    this.r = golden ? 16 : rand(11, 15);
+    const m = 50;
+    this.x = rand(m, W-m); this.y = rand(m, H-m);
+    for (let t=0; t<8 && Game.goog && dist2(this.x,this.y,Game.goog.x,Game.goog.y) < 130*130; t++) { this.x = rand(m, W-m); this.y = rand(m, H-m); }
+    this.phase = rand(TAU); this.hue = golden ? 48 : pick(SNACK_HUES);
+    this.golden = golden; this.spin = rand(-3, 3); this.born = 0; this.spawnScale = 0;
+    this.wob = 0;
+  }
+  update(dt) { this.phase += dt*4; this.born += dt; this.spawnScale = Math.min(1, this.spawnScale + dt*5); this.wob = Math.sin(this.phase)*2; }
+  draw(ctx) {
+    const r = this.r * this.spawnScale * (1 + Math.sin(this.phase*1.5)*0.06);
+    const x = this.x, y = this.y + this.wob;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(this.phase*this.spin*0.1);
+    if (this.golden) {
+      // star-ish golden snackle
+      ctx.beginPath();
+      for (let i=0;i<10;i++){ const a=i/10*TAU; const rr=i%2?r*0.5:r; ctx.lineTo(Math.cos(a)*rr, Math.sin(a)*rr); }
+      ctx.closePath();
+      ctx.fillStyle = "#ffd84a"; ctx.shadowColor="rgba(255,216,74,0.9)"; ctx.shadowBlur=18; ctx.fill(); ctx.shadowBlur=0;
+      ctx.fillStyle="rgba(255,255,255,0.85)"; ctx.beginPath(); ctx.arc(-r*0.25,-r*0.25,r*0.22,0,TAU); ctx.fill();
+    } else {
+      const g = ctx.createRadialGradient(-r*0.3,-r*0.3,r*0.1,0,0,r);
+      g.addColorStop(0, `hsl(${this.hue},90%,75%)`); g.addColorStop(1, `hsl(${this.hue},85%,52%)`);
+      ctx.beginPath(); ctx.arc(0,0,r,0,TAU); ctx.fillStyle=g;
+      ctx.shadowColor=`hsla(${this.hue},90%,60%,0.7)`; ctx.shadowBlur=12; ctx.fill(); ctx.shadowBlur=0;
+      ctx.fillStyle="rgba(255,255,255,0.7)"; ctx.beginPath(); ctx.arc(-r*0.3,-r*0.3,r*0.25,0,TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+class Hazard {
+  constructor(speed) {
+    this.r = rand(20, 30);
+    // spawn at a random edge
+    const edge = (Math.random()*4)|0;
+    if (edge===0){ this.x=-this.r; this.y=rand(H); }
+    else if(edge===1){ this.x=W+this.r; this.y=rand(H); }
+    else if(edge===2){ this.x=rand(W); this.y=-this.r; }
+    else { this.x=rand(W); this.y=H+this.r; }
+    const a = rand(TAU);
+    this.vx = Math.cos(a)*speed; this.vy = Math.sin(a)*speed;
+    this.spin = rand(-2,2); this.rot = rand(TAU); this.spikes = 7 + ((Math.random()*4)|0);
+    this.hue = rand(0, 30); this.born = 0;
+  }
+  update(dt) {
+    this.born += dt; this.rot += this.spin*dt;
+    this.x += this.vx*dt; this.y += this.vy*dt;
+    // only bounce once they've fully entered the field (born>0.4 ensures inside)
+    const r = this.r;
+    if (this.born > 0.3) {
+      if (this.x < r){ this.x=r; this.vx=Math.abs(this.vx); }
+      if (this.x > W-r){ this.x=W-r; this.vx=-Math.abs(this.vx); }
+      if (this.y < r){ this.y=r; this.vy=Math.abs(this.vy); }
+      if (this.y > H-r){ this.y=H-r; this.vy=-Math.abs(this.vy); }
+    }
+  }
+  draw(ctx) {
+    const r = this.r;
+    ctx.save(); ctx.translate(this.x, this.y); ctx.rotate(this.rot);
+    ctx.beginPath();
+    for (let i=0;i<this.spikes*2;i++){ const a=i/(this.spikes*2)*TAU; const rr=i%2?r:r*0.66; ctx.lineTo(Math.cos(a)*rr, Math.sin(a)*rr); }
+    ctx.closePath();
+    const g = ctx.createRadialGradient(-r*0.3,-r*0.3,r*0.1,0,0,r);
+    g.addColorStop(0, `hsl(${this.hue},95%,62%)`); g.addColorStop(1, `hsl(${this.hue+10},90%,40%)`);
+    ctx.fillStyle=g; ctx.shadowColor=`hsla(${this.hue},90%,50%,0.7)`; ctx.shadowBlur=16; ctx.fill(); ctx.shadowBlur=0;
+    ctx.restore();
+    // angry googly eyes (theme cohesion), drawn upright
+    const eyeR = r*0.22, off = r*0.30;
+    for (let i=0;i<2;i++){ const s=i===0?-1:1;
+      const ex=this.x+s*off, ey=this.y-r*0.05;
+      ctx.beginPath(); ctx.arc(ex,ey,eyeR,0,TAU); ctx.fillStyle="#fff"; ctx.fill();
+      ctx.beginPath(); ctx.arc(ex+s*eyeR*0.2,ey+eyeR*0.2,eyeR*0.5,0,TAU); ctx.fillStyle="#200"; ctx.fill();
+    }
+  }
+}
+
+class Particle {
+  constructor(x,y,opts={}) {
+    this.x=x; this.y=y; const a=opts.a!==undefined?opts.a:rand(TAU); const s=opts.s||rand(60,260);
+    this.vx=Math.cos(a)*s; this.vy=Math.sin(a)*s;
+    this.life=opts.life||rand(0.4,0.8); this.maxLife=this.life;
+    this.r=opts.r||rand(2,6); this.color=opts.color||"#fff"; this.grav=opts.grav||0;
+  }
+  update(dt){ this.life-=dt; this.vy+=this.grav*dt; this.vx*=Math.exp(-2*dt); this.vy*=Math.exp(-2*dt); this.x+=this.vx*dt; this.y+=this.vy*dt; }
+  draw(ctx){ const t=clamp(this.life/this.maxLife,0,1); ctx.globalAlpha=t; ctx.beginPath(); ctx.arc(this.x,this.y,this.r*t+0.5,0,TAU); ctx.fillStyle=this.color; ctx.fill(); ctx.globalAlpha=1; }
+}
+
+class FloatText {
+  constructor(x,y,text,color="#fff",size=22){ this.x=x; this.y=y; this.text=text; this.color=color; this.size=size; this.life=0.9; this.max=0.9; }
+  update(dt){ this.life-=dt; this.y-=40*dt; }
+  draw(ctx){ const t=clamp(this.life/this.max,0,1); ctx.globalAlpha=t; ctx.font=`bold ${this.size}px "Comic Sans MS",sans-serif`; ctx.textAlign="center";
+    ctx.lineWidth=4; ctx.strokeStyle="rgba(0,0,0,0.5)"; ctx.strokeText(this.text,this.x,this.y);
+    ctx.fillStyle=this.color; ctx.fillText(this.text,this.x,this.y); ctx.globalAlpha=1; }
+}
+
+// ============================================================
+//  POWER-UP (Goog Juice) — appears occasionally
+// ============================================================
+const PUPS = [
+  { key:"shield", color:"#46c8ff", label:"SHIELD!", glyph:"🛡" },
+  { key:"speed",  color:"#ffd84a", label:"TURBO!",  glyph:"⚡" },
+  { key:"magnet", color:"#ff6ad5", label:"MAGNET!", glyph:"🧲" },
+];
+class PowerUp {
+  constructor(){ const m=60; this.x=rand(m,W-m); this.y=rand(m,H-m); this.r=18; this.phase=rand(TAU);
+    for (let t=0; t<8 && Game.goog && dist2(this.x,this.y,Game.goog.x,Game.goog.y) < 150*150; t++) { this.x=rand(m,W-m); this.y=rand(m,H-m); }
+    this.type=pick(PUPS); this.life=11; this.spawnScale=0; }
+  update(dt){ this.phase+=dt*3; this.life-=dt; this.spawnScale=Math.min(1,this.spawnScale+dt*4); }
+  draw(ctx){ const r=this.r*this.spawnScale*(1+Math.sin(this.phase*2)*0.08); const blink=this.life<3?(Math.floor(this.life*8)%2===0?0.35:1):1;
+    ctx.save(); ctx.globalAlpha=blink; ctx.translate(this.x,this.y);
+    ctx.beginPath(); ctx.arc(0,0,r,0,TAU);
+    const g=ctx.createRadialGradient(-r*0.3,-r*0.3,r*0.1,0,0,r); g.addColorStop(0,"#fff"); g.addColorStop(1,this.type.color);
+    ctx.fillStyle=g; ctx.shadowColor=this.type.color; ctx.shadowBlur=20; ctx.fill(); ctx.shadowBlur=0;
+    ctx.font=`${r*1.1}px sans-serif`; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText(this.type.glyph,0,1);
+    ctx.restore(); ctx.textBaseline="alphabetic"; }
+}
+
+// ============================================================
+//  BACKGROUND
+// ============================================================
+let bgBlobs = [], bgT = 0;
+function initBg(){ bgBlobs = Array.from({length:7},()=>({x:rand(W),y:rand(H),r:rand(60,200),vx:rand(-12,12),vy:rand(-12,12),hue:rand(360)})); }
+function updateBg(dt){ bgT+=dt; for(const b of bgBlobs){ b.x+=b.vx*dt; b.y+=b.vy*dt;
+  if(b.x<-b.r)b.x=W+b.r; if(b.x>W+b.r)b.x=-b.r; if(b.y<-b.r)b.y=H+b.r; if(b.y>H+b.r)b.y=-b.r; } }
+function drawBg(ctx){ const g=ctx.createLinearGradient(0,0,W,H); const p=(Math.sin(bgT*0.3)+1)/2;
+  g.addColorStop(0,`hsl(${260+p*20},55%,12%)`); g.addColorStop(1,`hsl(${290+p*30},50%,9%)`);
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  ctx.globalCompositeOperation="lighter";
+  for(const b of bgBlobs){ const rg=ctx.createRadialGradient(b.x,b.y,0,b.x,b.y,b.r);
+    rg.addColorStop(0,`hsla(${b.hue},70%,50%,0.10)`); rg.addColorStop(1,`hsla(${b.hue},70%,50%,0)`);
+    ctx.fillStyle=rg; ctx.fillRect(b.x-b.r,b.y-b.r,b.r*2,b.r*2); }
+  ctx.globalCompositeOperation="source-over"; }
+
+// ============================================================
+//  GAME  — state machine + systems
+// ============================================================
+const Game = {
+  state: "title",          // title | playing | gameover
+  goog: null,
+  snackles: [], hazards: [], particles: [], floats: [], powerups: [],
+  score: 0, lives: 3, best: 0,
+  combo: 0, comboTimer: 0,
+  elapsed: 0, snackTarget: 5, hazTimer: 0, pupTimer: 0,
+  shake: 0, overLock: 0, goldenTimer: 0,
+  flash: { a:0, color:"#fff" },
+  power: { shield:0, speed:0, magnet:0 },
+
+  init() {
+    this.goog = new Goog();
+    this.best = +(localStorage.getItem("wiggleGoogBest") || 0);
+    initBg();
+  },
+  reset() {
+    this.goog.reset();
+    this.snackles.length = this.hazards.length = this.particles.length = this.floats.length = this.powerups.length = 0;
+    this.score = 0; this.lives = 3; this.combo = 0; this.comboTimer = 0;
+    this.elapsed = 0; this.snackTarget = 5; this.hazTimer = 2; this.pupTimer = 12;
+    this.shake = 0; this.goldenTimer = rand(6,11);
+    this.power.shield = this.power.speed = this.power.magnet = 0;
+    for (let i=0;i<5;i++) this.snackles.push(new Snackle());
+    this.hazards.push(new Hazard(110));
+  },
+  onActionKey() {
+    if (this.state === "title") { this.start(); }
+    else if (this.state === "gameover" && this.overLock <= 0) { this.start(); }
+  },
+  start() { this.reset(); this.state = "playing"; Sound.start(); },
+
+  difficulty() { return 1 + this.elapsed / 30; }, // ramps over time
+
+  addScore(n, x, y, color) {
+    this.score += n;
+    this.floats.push(new FloatText(x, y, "+"+n, color, 20 + Math.min(this.combo,10)));
+  },
+  burst(x,y,color,count=10,spread={}) {
+    for (let i=0;i<count;i++) this.particles.push(new Particle(x,y,{color, ...spread}));
+  },
+  addShake(v) { this.shake = Math.min(28, this.shake + v); },
+
+  hurt() {
+    if (this.goog.invuln > 0 || this.power.shield > 0) return;
+    this.lives--; this.combo = 0; this.comboTimer = 0;
+    this.goog.invuln = 1.7; this.goog.r = Math.max(BASE_R, this.goog.r * 0.78);
+    this.addShake(22); Sound.hurt(); this.flash.a = 0.5; this.flash.color = "255,70,70";
+    this.burst(this.goog.x, this.goog.y, "#ff5a5a", 22, { s:[60,300], life:1 });
+    this.floats.push(new FloatText(this.goog.x, this.goog.y - this.goog.r, "OUCH!", "#ff6b6b", 30));
+    if (this.lives <= 0) this.gameOver();
+  },
+  gameOver() {
+    this.state = "gameover"; this.overLock = 0.7; Sound.over();
+    if (this.score > this.best) { this.best = this.score; localStorage.setItem("wiggleGoogBest", this.best); }
+  },
+
+  givePower(type) {
+    Sound.power();
+    if (type.key === "shield") this.power.shield = 7;
+    if (type.key === "speed")  this.power.speed = 6;
+    if (type.key === "magnet") this.power.magnet = 7;
+    this.floats.push(new FloatText(this.goog.x, this.goog.y - this.goog.r - 10, type.label, type.color, 30));
+    this.burst(this.goog.x, this.goog.y, type.color, 18, { s:[80,260] });
+  },
+
+  update(dt) {
+    updateBg(dt);
+    if (this.overLock > 0) this.overLock -= dt;
+    this.shake *= Math.exp(-6*dt); if (this.shake < 0.2) this.shake = 0;
+    if (this.flash.a > 0.001) this.flash.a *= Math.exp(-4.5*dt); else this.flash.a = 0;
+
+    const playing = this.state === "playing";
+    // Goog: controllable while playing; gently idle-wiggles otherwise
+    this.goog.update(dt, playing);
+    // keep goog visible during title (recenter slowly when not playing)
+    if (!playing) {
+      this.goog.x = lerp(this.goog.x, W/2, 1 - Math.exp(-3*dt));
+      this.goog.y = lerp(this.goog.y, H*0.42, 1 - Math.exp(-3*dt));
+    }
+
+    for (const p of this.particles) p.update(dt);
+    for (const f of this.floats) f.update(dt);
+    for (const s of this.snackles) s.update(dt);
+    this.particles = this.particles.filter(p => p.life > 0);
+    this.floats = this.floats.filter(f => f.life > 0);
+
+    if (!playing) return;
+
+    this.elapsed += dt;
+    // power timers
+    for (const k of ["shield","speed","magnet"]) if (this.power[k] > 0) this.power[k] = Math.max(0, this.power[k]-dt);
+    // combo decay
+    if (this.combo > 0) { this.comboTimer -= dt; if (this.comboTimer <= 0) this.combo = 0; }
+
+    // ---- snackle spawning (keep field populated, scale with difficulty) ----
+    this.snackTarget = 5 + Math.floor(this.elapsed / 12);
+    while (this.snackles.length < this.snackTarget) this.snackles.push(new Snackle());
+    // occasional golden
+    this.goldenTimer -= dt;
+    if (this.goldenTimer <= 0) { this.snackles.push(new Snackle(true)); this.goldenTimer = rand(9, 16); }
+
+    // ---- hazard spawning ----
+    this.hazTimer -= dt;
+    const maxHaz = Math.min(14, 1 + Math.floor(this.elapsed / 9));
+    if (this.hazTimer <= 0 && this.hazards.length < maxHaz) {
+      this.hazards.push(new Hazard(90 + this.difficulty()*28));
+      this.hazTimer = clamp(4 - this.elapsed*0.04, 1.1, 4);
+    }
+    for (const h of this.hazards) h.update(dt);
+
+    // ---- power-up spawning ----
+    this.pupTimer -= dt;
+    if (this.pupTimer <= 0 && this.powerups.length === 0) { this.powerups.push(new PowerUp()); this.pupTimer = rand(16, 26); }
+    for (const p of this.powerups) p.update(dt);
+    this.powerups = this.powerups.filter(p => p.life > 0);
+
+    const g = this.goog;
+    // ---- magnet: pull snackles toward goog ----
+    if (this.power.magnet > 0) {
+      for (const s of this.snackles) { const dx=g.x-s.x, dy=g.y-s.y, d=Math.hypot(dx,dy)||1;
+        if (d < 260) { s.x += dx/d * 380 * dt; s.y += dy/d * 380 * dt; } }
+    }
+
+    // ---- collisions: eat snackles ----
+    for (let i = this.snackles.length-1; i>=0; i--) {
+      const s = this.snackles[i];
+      const rad = g.eatRadius + s.r;
+      if (dist2(g.x,g.y,s.x,s.y) < rad*rad) {
+        this.snackles.splice(i,1);
+        this.combo++; this.comboTimer = 2.2;
+        const mult = 1 + Math.floor(this.combo/4);
+        const pts = (s.golden ? 50 : 10) * mult;
+        this.addScore(pts, s.x, s.y - s.r - 6, s.golden ? "#ffd84a" : `hsl(${s.hue},90%,70%)`);
+        g.r = Math.min(BASE_R*1.9, g.r + (s.golden ? 2.2 : 0.7));
+        g.hit(this.combo);
+        if (s.golden) { Sound.golden(); this.burst(s.x,s.y,"#ffd84a",20,{s:[80,300]}); this.addShake(6); this.flash.a = 0.28; this.flash.color = "255,216,74"; }
+        else { Sound.eat(this.combo); this.burst(s.x,s.y,`hsl(${s.hue},90%,65%)`,9); }
+        if (this.combo >= 2) this.floats.push(new FloatText(g.x, g.y - g.r - 18, "x"+mult+" combo!", "#fff", 16));
+      }
+    }
+    // ---- collisions: power-ups ----
+    for (let i = this.powerups.length-1; i>=0; i--) {
+      const p = this.powerups[i]; const rad = g.eatRadius + p.r;
+      if (dist2(g.x,g.y,p.x,p.y) < rad*rad) { this.givePower(p.type); this.powerups.splice(i,1); }
+    }
+    // ---- collisions: hazards ----
+    for (const h of this.hazards) {
+      const rad = g.r*0.85 + h.r*0.8;
+      if (dist2(g.x,g.y,h.x,h.y) < rad*rad) {
+        if (this.power.shield > 0) {
+          // bounce the hazard away, no damage
+          const dx=h.x-g.x, dy=h.y-g.y, d=Math.hypot(dx,dy)||1;
+          h.vx = dx/d * 240; h.vy = dy/d * 240; this.addShake(5);
+          this.burst((g.x+h.x)/2,(g.y+h.y)/2,"#9fe9ff",8);
+        } else if (g.invuln <= 0) {
+          // knockback
+          const dx=g.x-h.x, dy=g.y-h.y, d=Math.hypot(dx,dy)||1;
+          g.vx += dx/d*420; g.vy += dy/d*420;
+          this.hurt();
+        }
+      }
+    }
+  },
+
+  // ---------- RENDER ----------
+  draw(ctx) {
+    drawBg(ctx);
+    ctx.save();
+    if (this.shake > 0) ctx.translate(rand(-this.shake,this.shake), rand(-this.shake,this.shake));
+
+    for (const s of this.snackles) s.draw(ctx);
+    for (const p of this.powerups) p.draw(ctx);
+    for (const h of this.hazards) h.draw(ctx);
+    for (const p of this.particles) p.draw(ctx);
+    this.goog.draw(ctx);
+    for (const f of this.floats) f.draw(ctx);
+
+    // touch joystick indicator (so drag-to-move is discoverable on mobile)
+    if (this.state === "playing" && touchTarget) {
+      ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(touchTarget.x, touchTarget.y, 26, 0, TAU); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(this.goog.x, this.goog.y); ctx.lineTo(touchTarget.x, touchTarget.y);
+      ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2; ctx.stroke();
+    }
+    ctx.restore();
+
+    // vignette for depth
+    if (vignette) ctx.drawImage(vignette, 0, 0, W, H);
+    // low-life red pulse
+    if (this.state === "playing" && this.lives === 1) {
+      ctx.fillStyle = `rgba(255,40,40,${0.10 + 0.07*Math.sin(bgT*6)})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+    // hit / pickup screen flash
+    if (this.flash.a > 0.001) { ctx.fillStyle = `rgba(${this.flash.color},${this.flash.a})`; ctx.fillRect(0, 0, W, H); }
+
+    if (this.state === "playing") this.drawHUD(ctx);
+    else if (this.state === "title") this.drawTitle(ctx);
+    else if (this.state === "gameover") this.drawGameOver(ctx);
+
+    this.drawMuteButton(ctx);
+  },
+  drawMuteButton(ctx) {
+    const x = 14, y = H - 52, s = 38;
+    ctx.fillStyle = "rgba(255,255,255,0.10)";
+    ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, s, s, 9) : ctx.rect(x, y, s, s); ctx.fill();
+    ctx.font = "20px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.fillText(Sound.enabled ? "🔊" : "🔇", x + s/2, y + s/2 + 1);
+    ctx.textBaseline = "alphabetic";
+  },
+
+  drawHUD(ctx) {
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    // score
+    ctx.font = 'bold 30px "Comic Sans MS",sans-serif';
+    ctx.lineWidth = 5; ctx.strokeStyle = "rgba(0,0,0,0.45)";
+    ctx.strokeText("Score " + this.score, 18, 40); ctx.fillStyle = "#fff"; ctx.fillText("Score " + this.score, 18, 40);
+    ctx.font = '16px "Comic Sans MS",sans-serif';
+    ctx.fillStyle = "rgba(255,255,255,0.7)"; ctx.fillText("Best " + this.best, 20, 62);
+    // lives as mini goog faces (top-right)
+    for (let i=0;i<this.lives;i++) this.drawMiniGoog(ctx, W-30-i*40, 32, 14);
+    // combo meter
+    if (this.combo >= 2) {
+      const mult = 1 + Math.floor(this.combo/4);
+      ctx.textAlign = "center"; ctx.font = 'bold 22px "Comic Sans MS",sans-serif';
+      ctx.fillStyle = `hsl(${(this.elapsed*120)%360},90%,70%)`;
+      ctx.fillText(`COMBO x${mult}`, W/2, 36);
+      const bw = 160, t = clamp(this.comboTimer/2.2,0,1);
+      ctx.fillStyle = "rgba(255,255,255,0.2)"; ctx.fillRect(W/2-bw/2, 44, bw, 6);
+      ctx.fillStyle = "#ffd84a"; ctx.fillRect(W/2-bw/2, 44, bw*t, 6);
+    }
+    // active power-up pips
+    let py = 84; ctx.textAlign = "left"; ctx.font = '15px sans-serif';
+    for (const p of PUPS) if (this.power[p.key] > 0) {
+      ctx.fillStyle = p.color; ctx.fillText(`${p.glyph} ${p.label.replace("!","")} ${this.power[p.key].toFixed(1)}s`, 18, py); py += 22;
+    }
+  },
+  drawMiniGoog(ctx, x, y, r) {
+    ctx.beginPath(); ctx.arc(x,y,r,0,TAU); ctx.fillStyle="#27d98a"; ctx.fill();
+    for (let i=0;i<2;i++){ const s=i?1:-1; ctx.beginPath(); ctx.arc(x+s*r*0.4,y-r*0.1,r*0.4,0,TAU); ctx.fillStyle="#fff"; ctx.fill();
+      ctx.beginPath(); ctx.arc(x+s*r*0.4,y+r*0.05,r*0.2,0,TAU); ctx.fillStyle="#16121f"; ctx.fill(); }
+  },
+
+  drawTitle(ctx) {
+    ctx.textAlign = "center";
+    const wob = Math.sin(bgT*2)*6;
+    ctx.save(); ctx.translate(W/2, H*0.20); ctx.rotate(Math.sin(bgT*1.3)*0.03);
+    ctx.font = 'bold 74px "Comic Sans MS",sans-serif';
+    ctx.lineWidth = 10; ctx.strokeStyle = "rgba(0,0,0,0.5)";
+    ctx.strokeText("WIGGLE GOOG", 0, wob);
+    const grad = ctx.createLinearGradient(-200,0,200,0);
+    grad.addColorStop(0,"#7bf7c0"); grad.addColorStop(0.5,"#46c8ff"); grad.addColorStop(1,"#ff6ad5");
+    ctx.fillStyle = grad; ctx.fillText("WIGGLE GOOG", 0, wob);
+    ctx.restore();
+
+    ctx.font = '22px "Comic Sans MS",sans-serif'; ctx.fillStyle = "rgba(255,255,255,0.92)";
+    ctx.fillText("Gobble the snackles 🍬  —  dodge the wobbles 🔴", W/2, H*0.62);
+    ctx.font = '18px "Comic Sans MS",sans-serif'; ctx.fillStyle = "rgba(255,255,255,0.7)";
+    ctx.fillText("Move:  WASD / Arrow Keys / drag on touch", W/2, H*0.62 + 34);
+    ctx.fillText("Grab ⚡🛡🧲 power-ups  •  build combos for big points", W/2, H*0.62 + 60);
+
+    const a = 0.6 + 0.4*Math.sin(bgT*4);
+    ctx.font = 'bold 28px "Comic Sans MS",sans-serif';
+    ctx.fillStyle = `rgba(255,255,255,${a})`;
+    ctx.fillText("▶  Press any key  /  tap to play", W/2, H*0.80);
+    if (this.best > 0) { ctx.font = '18px "Comic Sans MS",sans-serif'; ctx.fillStyle = "#ffd84a";
+      ctx.fillText("Best: " + this.best, W/2, H*0.80 + 34); }
+  },
+
+  drawGameOver(ctx) {
+    ctx.fillStyle = "rgba(10,5,20,0.55)"; ctx.fillRect(0,0,W,H);
+    ctx.textAlign = "center";
+    ctx.save(); ctx.translate(W/2, H*0.32); ctx.rotate(Math.sin(bgT*2)*0.04);
+    ctx.font = 'bold 64px "Comic Sans MS",sans-serif';
+    ctx.lineWidth = 9; ctx.strokeStyle = "rgba(0,0,0,0.5)"; ctx.strokeText("GAME OVER", 0, 0);
+    ctx.fillStyle = "#ff6b6b"; ctx.fillText("GAME OVER", 0, 0);
+    ctx.restore();
+
+    const isBest = this.score >= this.best && this.score > 0;
+    ctx.font = 'bold 36px "Comic Sans MS",sans-serif'; ctx.fillStyle = "#fff";
+    ctx.fillText("Score: " + this.score, W/2, H*0.50);
+    ctx.font = '24px "Comic Sans MS",sans-serif';
+    ctx.fillStyle = isBest ? "#ffd84a" : "rgba(255,255,255,0.85)";
+    ctx.fillText(isBest ? "★ NEW BEST! ★" : "Best: " + this.best, W/2, H*0.50 + 40);
+
+    if (this.overLock <= 0) {
+      const a = 0.6 + 0.4*Math.sin(bgT*4);
+      ctx.font = 'bold 26px "Comic Sans MS",sans-serif'; ctx.fillStyle = `rgba(255,255,255,${a})`;
+      ctx.fillText("▶  Press any key  /  tap to wiggle again", W/2, H*0.68);
+    }
+  },
+};
+
+// ============================================================
+//  MAIN LOOP — fixed-timestep physics, rAF render
+// ============================================================
+Game.init();
+const STEP = 1/120;
+let acc = 0, last = performance.now();
+function frame(now) {
+  let dt = (now-last)/1000; last = now;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt; let guard = 0;
+  while (acc >= STEP && guard++ < 10) { Game.update(STEP); acc -= STEP; }
+  Game.draw(ctx);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
