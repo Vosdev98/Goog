@@ -501,9 +501,12 @@ const FOG=[0.10,0.06,0.20]; let FOG_D=0.011;
 
 function setCamera(targetX,targetZ,shakeX,shakeZ){
   const aspect=glCanvas.width/glCanvas.height;
-  PROJ=M4.perspective(48*Math.PI/180,aspect,0.5,220);
-  const cx=targetX*0.32, cz=targetZ*0.32;
-  CAM.pos=[cx+shakeX, 25, cz+30+shakeZ];
+  // zoom the camera out on narrow / portrait screens so the whole wide arena stays in view
+  let k=1; if(aspect<1.25) k=clamp(1.85/aspect,1,4.8);
+  PROJ=M4.perspective(48*Math.PI/180,aspect,0.5,420);
+  const fol=k>1?0.32/k:0.32;                         // ease camera-follow when zoomed way out
+  const cx=targetX*fol, cz=targetZ*fol;
+  CAM.pos=[cx+shakeX, 25*k, cz+30*k+shakeZ];
   VIEW=M4.lookAt(CAM.pos,[cx,1.5,cz-2],[0,1,0]);
   VP=M4.mul(PROJ,VIEW);
 }
@@ -1428,7 +1431,7 @@ const Game={
       c.beginPath();c.arc(x+s*r*0.4,y+r*0.05,r*0.2,0,TAU);c.fillStyle="#16121f";c.fill();}},
   drawTitle(){const c=uiCtx;c.textAlign="center";const wob=Math.sin(this.t*2)*6;
     c.save();c.translate(W/2,H*0.20);c.rotate(Math.sin(this.t*1.3)*0.03);
-    const tsz=Math.min(72,W*0.15); c.font='bold '+tsz+'px "Comic Sans MS",sans-serif';c.lineWidth=10;c.strokeStyle="rgba(0,0,0,0.5)";c.strokeText("WIGGLE GOOG",0,wob);
+    const tsz=Math.min(72,W*0.128); c.font='bold '+tsz+'px "Comic Sans MS",sans-serif';c.lineWidth=10;c.strokeStyle="rgba(0,0,0,0.5)";c.strokeText("WIGGLE GOOG",0,wob);
     const grad=c.createLinearGradient(-220,0,220,0);grad.addColorStop(0,"#7bf7c0");grad.addColorStop(0.5,"#46c8ff");grad.addColorStop(1,"#ff6ad5");
     c.fillStyle=grad;c.fillText("WIGGLE GOOG",0,wob);
     c.font='bold 26px "Comic Sans MS",sans-serif';c.fillStyle="#ffd84a";c.fillText("• 3D •",0,wob+44);c.restore();
@@ -1437,8 +1440,8 @@ const Game={
     c.font=Math.round(17*u)+'px "Comic Sans MS",sans-serif';c.fillStyle="rgba(255,255,255,0.7)";
     c.fillText(isMobile?"Move: left stick · look: drag · fire button":"Move:  WASD / Arrow Keys / drag on touch",W/2,H*0.64+34);
     c.fillText("Grab ⚡🛡🧲 power-ups · build combos",W/2,H*0.64+58);
-    const a=0.6+0.4*Math.sin(this.t*4);c.font='bold 28px "Comic Sans MS",sans-serif';c.fillStyle=`rgba(255,255,255,${a})`;
-    c.fillText("▶  Press any key  /  tap to play",W/2,H*0.82);
+    const a=0.6+0.4*Math.sin(this.t*4);c.font='bold '+Math.round(28*u)+'px "Comic Sans MS",sans-serif';c.fillStyle=`rgba(255,255,255,${a})`;
+    c.fillText(isMobile?"▶  Tap to play":"▶  Press any key  /  tap to play",W/2,H*0.82);
     if(this.best>0){c.font='18px "Comic Sans MS",sans-serif';c.fillStyle="#ffd84a";c.fillText("Best: "+this.best,W/2,H*0.82+34);}
     // dev: jump straight to tactical mode (bottom-left)
     {const tw=Math.max(176,176*u),th=Math.max(44,38*u),tx=64,ty=H-20-th;
